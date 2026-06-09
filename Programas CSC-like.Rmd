@@ -1,0 +1,390 @@
+---
+title: "Programas CSC-like"
+author: "Sara Morón El-Khalifi"
+date: "2026-05-26"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Cargamos los datos de entrada y creamos una carpeta nueva.
+
+```{r}
+# Cargamos los metadatos RNA-seq que habíamos descargado con TCGAbiolinks.
+rna_seq <- "C:/TFM/output_rnaseq.rds"
+
+# Carpeta con los archivos de expresión génica por muestra.
+rna_directorio <- "C:/TFM/GDCdata/TCGA-BRCA/Transcriptome_Profiling/Gene_Expression_Quantification"
+
+# Carpeta donde vamos a guardar los resultados de este análisis.
+output_directorio <- "C:/TFM/csc_like_stemness_outputs"
+dir.create(output_directorio, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Fijamos la firma que vamos a usar.
+
+```{r}
+marcadores <- data.frame(
+  firma_csc = c("CD44", "ALDH1A1", "CD24"),
+  sentido = c("positivo", "positivo", "negativo"),
+  stringsAsFactors = FALSE
+)
+marcadores
+
+# Mayores CD44 y ALDH1A1 favorecen un perfil más CSC-like, mientras que un mayor
+# CD24 lo aleja.
+```
+
+# 3. Cargamos el archivo resumen_muestras que habíamos guardado en el análisis de NetMHCpan.
+
+```{r}
+resumen_muestras <- readRDS("C:/TFM/resumen_muestras_netmhcpan.rds")
+head(resumen_muestras)
+dim(resumen_muestras)
+```
+
+# 4. Cargamos los datos de RNA-seq.
+
+```{r}
+rna_seq_info <- readRDS(rna_seq)
+names(rna_seq_info)
+```
+
+```{r}
+rna_seq_tabla <- rna_seq_info$results[[1]]
+
+rna_seq_tabla <- rna_seq_tabla[, c(
+  "sample.submitter_id",
+  "cases.submitter_id",
+  "file_id",
+  "file_name",
+  "created_datetime",
+  "sample_type"
+)]
+
+head(rna_seq_tabla)
+```
+
+# 5. Renombramos para que encaje con resumen_muestras.
+
+```{r}
+names(rna_seq_tabla)[names(rna_seq_tabla) == "sample.submitter_id"] <- "sample_id"
+names(rna_seq_tabla)[names(rna_seq_tabla) == "cases.submitter_id"] <- "patient_id"
+head(rna_seq_tabla)
+```
+
+# 6. Nos quedamos con las muestras que son tumores primarios y una sola fila por muestra.
+
+```{r}
+rna_seq_tabla <- rna_seq_tabla[rna_seq_tabla$sample_type == "Primary Tumor", ]
+rna_seq_tabla <- rna_seq_tabla[order(rna_seq_tabla$sample_id, rna_seq_tabla$created_datetime, decreasing = TRUE), ]
+rna_seq_tabla <- rna_seq_tabla[!duplicated(rna_seq_tabla$sample_id), ]
+
+head(rna_seq_tabla)
+dim(rna_seq_tabla)
+```
+
+# 7.Identificamos las muestras presentes tanto en RNA-seq como en resumen_muestras.
+
+```{r}
+muestras_comunes <- intersect(resumen_muestras$sample_id, rna_seq_tabla$sample_id)
+
+length(muestras_comunes)
+```
+
+
+# 8. Filtramos ambas tablas para quedarnos solo con las muestras comunes.
+
+```{r}
+resumen_muestras_comunes <- resumen_muestras[match(muestras_comunes, resumen_muestras$sample_id), ]
+rna_seq_comunes <- rna_seq_tabla[match(muestras_comunes, rna_seq_tabla$sample_id), ]
+
+head(resumen_muestras_comunes)
+head(rna_seq_comunes)
+dim(resumen_muestras_comunes)
+dim(rna_seq_comunes)
+```
+
+# 9. Construimos la ruta al archivo de expresión de cada muestra y comprobamos que existan.
+
+```{r}
+rna_seq_comunes$file_path <- file.path(
+  rna_directorio,
+  rna_seq_comunes$file_id,
+  rna_seq_comunes$file_name
+)
+
+head(rna_seq_comunes$file_path)
+
+table(file.exists(rna_seq_comunes$file_path))
+```
+
+# 10. Definir la función para leer los TPM de los marcadores.
+
+```{r}
+# Buscamos los marcadores CD44, ALDH1A1 y CD24 y sus valores de TPM.
+
+buscador_marcadores_tpm <- function (file_path, marcadores) {
+  columnas <- c(
+    "character", #gene_id
+    "character", #gene_name
+    "NULL", #gene_type
+    "NULL", #unstranded
+    "NULL", #stranded_first
+    "NULL", #stranded_second
+    "numeric", #tpm_unstranded
+    "NULL", #fpkm_unstranded
+    "NULL" #fpkm_uq_unstranded
+  )
+  
+  datos <- read.delim(
+    file_path,
+    sep = "\t",
+    skip = 1,
+    header = TRUE,
+    stringsAsFactors = FALSE,
+    quote = "",
+    comment.char = "",
+    colClasses = columnas
+  )
+  
+  datos <- datos[datos$gene_name %in% marcadores, c("gene_name", "tpm_unstranded")]
+  
+  if (nrow(datos) == 0) {
+    salida <- setNames(rep(NA_real_, length(marcadores)), marcadores)
+    return(salida)
+  }
+  
+  valores <- tapply(datos$tpm_unstranded, datos$gene_name, mean, na.rm = TRUE)
+  
+  salida <- setNames(rep(NA_real_, length(marcadores)), marcadores)
+  salida[names(valores)] <- as.numeric(valores)
+  
+  salida
+}
+```
+
+# 11. Probar la función con una muestra.
+
+```{r}
+genes_csc <- marcadores$firma_csc
+
+buscador_marcadores_tpm(rna_seq_comunes$file_path[1], genes_csc)
+```
+# 12. Crear la matriz vacía.
+
+```{r}
+matriz_marcadores <- matrix(
+  NA_real_,
+  nrow = nrow(rna_seq_comunes),
+  ncol = length(genes_csc),
+  dimnames = list(rna_seq_comunes$sample_id, genes_csc)
+)
+
+dim(matriz_marcadores)
+```
+
+# 13. Rellenarla por muestra.
+
+```{r}
+for (i in seq_len(nrow(rna_seq_comunes))) {
+  matriz_marcadores[i, ] <- buscador_marcadores_tpm(
+    file_path = rna_seq_comunes$file_path[i],
+    marcadores = genes_csc
+  )
+  
+  if (i %% 50 == 0 || i == nrow(rna_seq_comunes)) {
+    cat(i, "/", nrow(rna_seq_comunes), "muestras procesadas\n")
+  }
+}
+```
+
+# 14. Comprobar que ya existe la matrix
+
+```{r}
+head(matriz_marcadores)
+summary(matriz_marcadores[, "CD44"])
+summary(matriz_marcadores[, "ALDH1A1"])
+summary(matriz_marcadores[, "CD24"])
+```
+
+# 15. Puntuación CSC-like.
+
+```{r}
+# Aplicamos la transformación logarítmica a los marcadores para reducir la
+# asimetría entre los valores de TPM y hacerlos más comparables.
+
+marcadores_log <- log2(matriz_marcadores + 1)
+marcadores_zscore <- scale(marcadores_log)
+marcadores_zscore <- as.matrix(marcadores_zscore)
+
+# Calculamos la puntuación de cada muestra de manera que un CD44 y un ALDH1A1
+# altos suman, mientras que un CD24 alto resta en cuanto a generar un perfil más
+# CSC-like.
+
+puntuaciones_csc_like <- rowMeans(
+  cbind(
+    marcadores_zscore[, "CD44"],
+    marcadores_zscore[, "ALDH1A1"],
+    -marcadores_zscore[, "CD24"]
+  ),
+  na.rm = TRUE
+)
+
+# Creamos la tabla resultante.
+
+csc_puntuaciones <- data.frame(
+  sample_id = rownames(matriz_marcadores),
+  puntuaciones_csc_like = puntuaciones_csc_like,
+  row.names = NULL,
+  stringsAsFactors = FALSE
+)
+```
+
+
+# 16. Unir con resumen_muestras.
+
+```{r}
+# Unimos la información de NetMHCpan con la puntuación de CSC-like.
+
+csc_datos_finales <- merge(
+  resumen_muestras_comunes,
+  csc_puntuaciones,
+  by = "sample_id",
+  all.x = TRUE
+)
+
+head(csc_datos_finales)
+dim(csc_datos_finales)
+```
+
+# 17. Visión global sobre una correlación directa entre la puntuación CSC-like y las variables n_binders y el EL_rank.
+
+```{r}
+correlacion_binders <- cor.test(csc_datos_finales$puntuaciones_csc_like,
+                                csc_datos_finales$n_binders,
+                                method = "spearman",
+                                exact = FALSE)
+correlacion_binders
+```
+
+```{r}
+correlacion_elrank <- cor.test(csc_datos_finales$puntuaciones_csc_like,
+                               csc_datos_finales$mejor_EL_rank,
+                               method = "spearman",
+                               exact = FALSE)
+correlacion_elrank
+```
+
+
+# 18. Definimos los grupos según la carga binder y el valor de EL_rank.
+
+```{r}
+# Definimos un grupo con alta carga binder y otro grupo con el resto.
+
+punto_corte_binders <- quantile(csc_datos_finales$n_binders, probs = 0.75, na.rm = TRUE)
+
+csc_datos_finales$grupo_binders <- ifelse(
+  csc_datos_finales$n_binders >= punto_corte_binders,
+  "alta_carga_binders",
+  "resto"
+)
+
+table(csc_datos_finales$grupo_binders)
+
+conteos_binders <- as.data.frame(table(csc_datos_finales$grupo_binders))
+names(conteos_binders) <- c("grupo", "n")
+```
+
+```{r}
+# Definimos un grupo con el mejor EL_rank y otro grupo con el resto.
+
+punto_corte_elrank <- quantile(csc_datos_finales$mejor_EL_rank, probs = 0.25, na.rm = TRUE)
+
+csc_datos_finales$grupo_elrank <- ifelse(
+  csc_datos_finales$mejor_EL_rank <= punto_corte_elrank,
+  "mejor_afinidad",
+  "resto"
+)
+
+table(csc_datos_finales$grupo_elrank)
+
+conteos_elrank <- as.data.frame(table(csc_datos_finales$grupo_elrank))
+names(conteos_elrank) <- c("grupo", "n")
+```
+```{r}
+# Medianas por grupo.
+
+medianas_binders <- aggregate(puntuaciones_csc_like ~ grupo_binders, data = csc_datos_finales, median, na.rm = TRUE)
+
+names(medianas_binders) <- c("grupo", "mediana_csc_like")
+
+medianas_elrank <- aggregate(puntuaciones_csc_like ~ grupo_elrank, data = csc_datos_finales, median, na.rm = TRUE)
+
+names(medianas_elrank) <- c("grupo", "mediana_csc_like")
+```
+
+```{r}
+resumen_binders <- merge(conteos_binders, medianas_binders, by = "grupo")
+resumen_binders$comparacion <- "carga_binders"
+resumen_binders <- resumen_binders[, c("comparacion", "grupo", "n", "mediana_csc_like")]
+
+resumen_elrank <- merge(conteos_elrank, medianas_elrank, by = "grupo")
+resumen_elrank$comparacion <- "afinidad"
+resumen_elrank <- resumen_elrank[, c("comparacion", "grupo", "n", "mediana_csc_like")]
+
+resumen_grupos <- rbind(resumen_binders, resumen_elrank)
+
+resumen_grupos
+```
+Las muestras con mayor carga binder presentaron una mediana del score CSC-like superior a la observada en el resto de muestras (0.146 frente a -0.031). Las muestras con mejor afinidad predicha mostraron también una mediana más elevada que el resto (0.119 frente a -0.017). En ambos casos, tanto una alta carga de binders como para una mejor afinidad, fueron consistentes con una mayor puntuación CSC-like. Por tanto, la tabla sugiere que más binders y mejor afinidad se asocian descriptivamente con puntuaciones CSC-like algo mayores.
+
+# 19. Comparamos los grupos.
+
+```{r}
+# Comparamos las puntuaciones entre el grupo con alta carga binder y el resto.
+
+test_binders <- wilcox.test(
+  puntuaciones_csc_like ~ grupo_binders,
+  data = csc_datos_finales,
+  exact = FALSE
+)
+
+# Comparamos las puntuaciones entre el grupo con mejor EL_rank y el resto.
+
+test_elrank <- wilcox.test(
+  puntuaciones_csc_like ~ grupo_elrank,
+  data= csc_datos_finales,
+  exact = FALSE
+)
+
+test_binders
+test_elrank
+```
+Las mayores puntuaciones de CSC-like parecen estar más relacionadas con la cantidad total de binders que con el mejor valor de afinidad. El análisis exploratorio mostró que las muestras con mayor carga binder presentaron puntuaciones CSC-like significativamnete más elevadas que el resto (p = 0,029). En cambio, no se observaron diferencias claras en la puntuación CSC-like al comparar las muestras con mejor afinidad predicha frente al resto (p = 0,399).
+
+```{r}
+write.csv(
+  resumen_grupos,
+  file = file.path(output_directorio, "csc_like_resumen_grupos.csv"),
+  row.names = FALSE
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,470 @@
+---
+title: "NetMHCpan Análisis de resultados"
+author: "Sara Morón El-Khalifi"
+date: "2026-05-11"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Preparamos el entorno de trabajo y cargamos los datos de entrada procedentes de NetMHCpan. 
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+ruta_netmhcpan <- "C:/TFM/NetMHCpan.xls"
+lineas_netmhcpan <- readLines(ruta_netmhcpan)
+```
+
+## 2. Preparación de los datos.
+
+### 2.1. Identificamos los nombres de los alelos.
+
+```{r}
+# Extraemos los nombres de los alelos a partir de la segunda línea de 
+# nuestro archivo, indicando que se encuentra separada por tabuladores.
+# Eliminamos las celdas vacías para quedarnos únicamente con los nombres de los 
+#alelos.
+
+alelos <- strsplit(lineas_netmhcpan[2], "\t")[[1]]
+
+alelos <- alelos[nzchar(alelos)]
+alelos
+length(alelos)
+```
+
+Verificamos que tenemos un total de 12 alelos.
+
+### 2.2. Lectura de la tabla de datos.
+
+```{r}
+# Indicamos que las primeras tres líneas no se lean ya que corresponden al 
+# comando de ejecución de NetMHCpan, los nombres de los 
+# alelos y los nombres del encabezado.
+
+netmhcpan_wide <- read.delim(
+  ruta_netmhcpan,
+  sep = "\t",
+  skip = 3,
+  header = FALSE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+nrow(netmhcpan_wide)
+```
+Con este resultado verificamos que tenemos 2.561 péptidos de entrada del archivo procedente de NetMHCpan.
+
+### 2.3. Asignamos los nombres a las columnas. 
+
+```{r}
+# Construimos los nombres de las columnas de la tabla de NetMHCpan siguiendo la
+# estructura y los nombres originales del archivo de entrada.
+
+columnas_netmhcpan <- c(
+  "Pos", "Peptide", "ID",
+  unlist(lapply(
+    alelos,
+    function(a) paste(a, c("core", "icore", "EL_score", "EL_rank", "BA_score", "BA_rank"), sep = "__")
+  )),
+  "Ave", "NB"
+)
+
+# Comprobamos que el número de columnas de la tabla sea la misma cantidad que 
+# el número de nombres que hemos generado, TRUE nos indica que tienen el mismo 
+# número.
+
+ncol(netmhcpan_wide) == length(columnas_netmhcpan)
+
+#Asignamos los nombres a las columnas de la tabla 
+
+colnames(netmhcpan_wide) <- columnas_netmhcpan
+
+dim(netmhcpan_wide)
+head(netmhcpan_wide[, 1:15])
+```
+
+### 2.4. Transformación de la tabla.
+
+Pasamos nuestra tabla de formato ancho a formato largo para facilitar el análisis. En la tabla original, encontramos un péptido por cada fila y cada alelo ocupa 6 columnas. Tras la transformación, cada fila representa la predicción de un péptido frente a un alelo concreto.
+
+```{r}
+# Extraemos las columnas de cada uno de los alelos y les asignamos nombres más
+# fáciles de reconocer.
+
+netmhcpan_peptido_alelo <- bind_rows(lapply(alelos, function(a) {
+  netmhcpan_wide %>%
+    transmute(
+      Posicion = Pos,
+      peptido_mutado = Peptide,
+      ID = ID,
+      alelo = a,
+      core = .data[[paste0(a, "__core")]],
+      icore = .data[[paste0(a, "__icore")]],
+      EL_score = as.numeric(.data[[paste0(a, "__EL_score")]]),
+      EL_rank = as.numeric(.data[[paste0(a, "__EL_rank")]]),
+      BA_score = as.numeric(.data[[paste0(a, "__BA_score")]]),
+      BA_rank = as.numeric(.data[[paste0(a, "__BA_rank")]]),
+      Ave = as.numeric(Ave),
+      NB = as.numeric(NB)
+    )
+}))
+```
+
+Añadimos nuevas columnas a nuestra tabla: para calcular la longitud del péptido contando sus caracteres, y para clasificar la predicción en una categoría de unión según EL_rank.
+
+```{r}
+netmhcpan_peptido_alelo <- netmhcpan_peptido_alelo %>%
+  mutate(
+    peptide_length = nchar(peptido_mutado),
+    binder_class = case_when(
+      EL_rank <= 0.5 ~ "SB",
+      EL_rank <= 2 ~ "WB",
+      TRUE ~ "non_binder"
+    )
+  )
+
+dim(netmhcpan_peptido_alelo)
+head(netmhcpan_peptido_alelo)
+table(netmhcpan_peptido_alelo$binder_class)
+```
+
+Obtenemos un total de 30.732 predicciones péptido-alelo, lo que concuerda con la cantidad de predicciones que esperamos al tener 2561 péptidos x 12 alelos.
+
+De estas predicciones, tenemos 30.182 non_binder, 147 strong binder (SB) y 403 weak binder (WB) a nivel péptido-alelo.
+
+## 3. Integración con la información biológica de los péptidos.
+
+A continuación, integramos las predicciones obtenidas con NetMHCpan con la información biológica asociada a cada péptido, como el gen del que procede, el paciente en el que aparece, y sus valores de TPM, VAF y recurrencia.
+ 
+```{r}
+tabla_peptidos_mutados <- readRDS("tabla_peptidos_mutados.rds")
+peptidos_recurrentes_filtrados <- readRDS("peptidos_recurrentes_filtrados.rds")
+
+# Unimos la tabla de péptidos mutados con la tabla con información de 
+# recurrencia, uniendo ambas tablas por la secuencia del péptido mutado
+# y su longitud. De manera que añadimos a la tabla de péptidos mutados las 
+# columnas: n_eventos, n_pacientes, n_muestras, genes y mutaciones, para que 
+# cada péptido tenga información de su recurrencia a nivel de cohorte.
+
+# Usamos la función distinct() para eliminar los duplicados, para que cada 
+# fila corresponda a una combinación única de las variables seleccionadas. Si un 
+# mismo péptido aparece en varios pacientes o muestras, generará varias 
+# filas, lo que nos permitirá posteriormente hacer el análisis por paciente, 
+# muestra o gen.
+
+informacion_recurrencia <- peptidos_recurrentes_filtrados %>%
+  select(
+    peptido_mutado,
+        peptide_length,
+        n_eventos,
+        n_pacientes,
+        n_muestras,
+        genes,
+        mutaciones
+  )
+
+peptidos_recurrentes_anotados <- tabla_peptidos_mutados %>%
+  inner_join(
+   informacion_recurrencia,
+    by = c("peptido_mutado", "peptide_length")
+    ) %>%
+  distinct(
+    patient_id,
+    sample_id,
+    gene_symbol,
+    protein_change,
+    TPM,
+    proporcion_alelica_dna,
+    prioridad_final,
+    peptide_length,
+    peptido_wt,
+    peptido_mutado,
+    n_eventos,
+    n_pacientes,
+    n_muestras,
+    genes,
+    mutaciones
+  )
+
+netmhcpan_anotado <- netmhcpan_peptido_alelo %>%
+  left_join(
+    peptidos_recurrentes_anotados,
+    by = c("peptido_mutado", "peptide_length")
+  )
+
+dim(netmhcpan_anotado)
+
+# El tamaño de la tabla aumenta después de añadir el contexto biológico 
+# porque una misma predicción péptido-alelo puede asociarse a varias muestras
+# o pacientes.
+
+sum(is.na(netmhcpan_anotado$gene_symbol))
+head(netmhcpan_anotado)
+```
+
+## 4. Creación de las tablas de análisis.
+
+### 4.1. Tablas base.
+
+Para cada péptido en cada muestra nos quedamos con el mejor alelo de HLA.
+
+```{r}
+# A partir de netmhcpan_anotado, que contiene la predicción de NetMHCpan y el 
+# contexto biológico, agrupamos cada combinación según los parámetros indicados
+# y conservamos únicamente de cada sample los alelos de los péptidos con mejores
+# valores de EL_rank.
+
+netmhcpan_muestra <- netmhcpan_anotado %>%
+  group_by(
+    patient_id,
+    sample_id,
+    gene_symbol,
+    protein_change,
+    peptido_mutado,
+    peptide_length
+  ) %>%
+  slice_min(EL_rank, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+dim(netmhcpan_muestra)
+``` 
+
+El tamaño de la tabla ya resumida a nivel péptido-muestra es de 10.405 filas. Esta tabla representa cuántas combinaciones péptido-muestra quedan en el caso de que nos quedemos solamente con el mejor alelo. Utilizaremos esta tabla para analizar binders por muestra, contar SB y WB, resumir por paciente y sacar los genes con más binders en el contexto de cohorte.
+
+### 4.2. Resumen a nivel de péptido único.
+
+Comparamos los alelos de cada péptido con mejor  afinidad de unión de cada sample (obtenido de la tabla anterior) con los demás péptidos y sus respectivos alelos. Como resultado nos quedamos con una fila representativa por cada péptido eligiendo las combinaciones con menor EL_rank. Es decir, si el péptido aparece en varias muestras nos quedamos con la fila que tuvo el menor EL_rank, es decir, la mejor afinidad predicha.
+
+```{r}
+# Partimos de netmhcpan_muestra donde tenemos una fila por péptido en cada 
+# muestra, conservando el mejor alelo de HLA. Agrupamos según los parámetros 
+# que hemos indicado y nos quedamos, para cada péptido único, solamente con la 
+# combinación de los parámetros con una mejor predicción observada. 
+
+columnas_peptido <- c(
+   "peptido_mutado",
+    "peptide_length",
+    "genes",
+    "mutaciones",
+    "n_pacientes",
+    "n_eventos"
+)
+
+resumen_peptido <- netmhcpan_muestra %>%
+  group_by(across(all_of(columnas_peptido))) %>%
+  slice_min(EL_rank, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# En esta tabla tenemos 2.561 péptidos únicos (los que teníamos inicialmente),
+# de los cuales, 130 son SB y 273 son WB. Es decir, 403 péptidos únicos (130 + 
+# 273) presentaron al menos una predicción favorable, esto representa 
+# aproximadamente el 15,7% del total de péptidos recurrentes evaluados. 
+# Aquí estamos evaluando cuántos péptidos, como candidatos únicos, tuvieron al 
+# menos una oportunidad real de unión favorable; no estamos observando cuántas
+# combinaciones péptido-alelo unian bien (como en el chunk anterior donde
+# teníamos 30.732 combinaciones de las cuales 147 fueron SB, 403 fueron WB y 
+# 30.182 fueron non-binder)
+
+# A continuación hacemos una tabla de la mejor predicción de cada candidato, 
+# ordenando la afinidad de mejor a peor.
+
+resumen_peptido %>% count(binder_class)
+
+top_peptidos <- resumen_peptido %>%
+  filter(binder_class != "non_binder") %>%
+  arrange(desc(n_pacientes), desc(n_eventos), EL_rank) %>%
+  select(all_of(columnas_peptido), alelo, EL_rank, binder_class) %>%
+  slice_head(n = 20)
+
+top_peptidos
+```
+
+### 4.3. Resumen por alelo.
+
+```{r}
+# Contamos cuántos strong binders y weak binders aporta cada alelo a nivel 
+# de muestra, después de conservar el mejor alelo por péptido-muestra, por tanto,
+# no estamos contando todas las combinaciones péptido-alelo posibles. 
+# En esta tabla vemos qué alelos recuperan más binders en total, cuáles 
+# concentran más SB y cuáles concentran sobre todo WB.
+
+# En la tabla a continuación, agrupamos por alelo y ordenamos de mayor a menor
+# n_binders y, en empate, por mejor EL_rank.
+
+resumen_alelo <- netmhcpan_muestra %>%
+  filter(binder_class != "non_binder") %>%
+  count(alelo, binder_class, sort = TRUE)
+
+resumen_alelo_total <- netmhcpan_muestra %>%
+  group_by(alelo) %>%
+  summarise(
+    n_SB = sum(binder_class == "SB", na.rm = TRUE),
+    n_WB = sum(binder_class == "WB", na.rm = TRUE),
+    n_binders = sum(binder_class != "non_binder", na.rm= TRUE),
+    mejor_EL_rank = min(EL_rank, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_binders), mejor_EL_rank)
+
+resumen_alelo_total
+```
+
+### 4.4. Resumen por muestra
+
+```{r}
+# Partimos de netmhcpan_muestra que tiene una fila por cada péptido en una 
+# muestra. En la tabla que creamos a continuación, una fila representa una 
+# muestra concreta, resumida en términos de número de péptidos, binders, mejor 
+# afinidad y contexto molecular de TPM y VAF.
+# Ordenamos de manera que arriba queden las muestras con más binders, y entre
+# ellas, las que además tengan el candidato más fuerte.
+
+resumen_muestras <- netmhcpan_muestra %>%
+  group_by(patient_id, sample_id) %>%
+  summarise(
+    n_peptidos = n_distinct(peptido_mutado),
+    n_SB = sum(binder_class == "SB", na.rm = TRUE),
+    n_WB = sum(binder_class == "WB", na.rm = TRUE),
+    n_binders = sum(binder_class != "non_binder", na.rm= TRUE),
+    mejor_EL_rank = min(EL_rank, na.rm = TRUE),
+    mediana_TPM = median(TPM, na.rm = TRUE),
+    mediana_VAF = median (proporcion_alelica_dna, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_binders), mejor_EL_rank)
+head(resumen_muestras, 20)
+```
+
+En esta tabla resumen a nivel de muestras vemos cómo se distribuyen los candidatos a neoantígenos entre las distintas muestras, vemos una carga neoantigénica heterogénea entre las muestras. Vemos qué muestras tienen un mayor número de binders, si predominan SB o WB, qué valores de mejor_EL_rank presentan y las medianas de TPM y VAF.
+Vemos que hay muestras con una carga binder claramente superior al resto. En general, las muestras presentan un mayor número de WB que SB, independientemente de si contienen una mayor candidad de binders. Aunque cabe destacar que encontramos varias muestras con un número total de binders inferior a la media general, pero con una mayor candidad de SB que WB, y con una mayor cantidad de SB que incluso aquellas muestras con más binders.
+También vemos muestras con un valor de EL_rank particularmente bajo aunque no tengan tantos binders, o la presencia de muchos binders pero un valor relativamente alto.
+No se observa una relación clara entre los valores de TPM y VAF y la cantidad de binders en las muestras.
+
+```{r}
+saveRDS(resumen_muestras, "C:/TFM/resumen_muestras_netmhcpan.rds")
+```
+
+
+### 4.5. Contexto biológico
+
+```{r}
+# Mostramos los genes que más contribuyen a la carga binder de la cohorte.
+ 
+resumen_genes <- netmhcpan_muestra %>%
+  filter(binder_class != "non_binder") %>%
+  count(gene_symbol, sort = TRUE)
+
+head(resumen_genes, 20)
+
+# Mostramos las mutaciones que más binders generan y sus respectivos genes.
+
+resumen_mutaciones <- netmhcpan_muestra %>%
+  filter(binder_class != "non_binder") %>%
+  count(gene_symbol, protein_change, sort = TRUE)
+
+head(resumen_mutaciones, 20)
+```
+
+Los binders se concentraron principalmente en genes recurrentemente alterados como TP53 y PIK3CA, en el conjunto de candidatos destacan algunas de sus mutaciones.
+La afinidad no se vio relacionada con la recurrencia.
+Los binders identificados procedieron de variantes con expresión VAF detectables. 
+
+### 4.6. Conteos comparativos entre niveles.
+
+```{r}
+resumir_nivel <- function(df, nivel) {
+  tibble::tibble(
+    nivel = nivel,
+    non_binder = sum(df$binder_class == "non_binder", na.rm = TRUE),
+    SB = sum(df$binder_class == "SB", na.rm = TRUE),
+    WB = sum(df$binder_class == "WB", na.rm = TRUE),
+    total = nrow(df)
+  )
+}
+
+conteos_niveles <- dplyr::bind_rows(
+  resumir_nivel(netmhcpan_peptido_alelo, "péptido-alelo"),
+  resumir_nivel(resumen_peptido, "péptido único"),
+  resumir_nivel(netmhcpan_muestra, "muestra")
+) %>%
+  mutate(
+    binders = SB + WB,
+    pct_binders = round(100 * binders / total, 2),
+    pct_SB = round(100 * SB / total, 2),
+    pct_WB = round(100 * WB / total, 2),
+    pct_non_binder = round(100 * non_binder / total, 2)
+  )
+
+conteos_niveles
+
+# En esta tabla resumen vemos que evaluamos 12 alelos sobre 2.561 
+# péptidos, generando 30.732 predicciones péptido-alelo. De las cuales, 
+# 147 fueron SB, 403 fueron WB y 30.182 fueron non-binder.
+```
+
+
+## 5. Figuras.
+
+```{r}
+theme_set(theme_minimal(base_size = 12))
+```
+
+```{r}
+union_peptidos <- data.frame(
+  categoria = factor(
+    c("Péptidos evaluados", "Péptidos binder", "Strong binders", "Weak binders"),
+    levels = c("Péptidos evaluados", "Péptidos binder", "Strong binders", "Weak binders")),
+  n = c(
+    nrow(peptidos_recurrentes_filtrados),
+    sum(resumen_peptido$binder_class != "non_binder"),
+    sum(resumen_peptido$binder_class == "SB"),
+    sum(resumen_peptido$binder_class == "WB")
+  ))
+
+ggplot(union_peptidos, aes(x = categoria, y = n, fill = categoria)) +
+  geom_col(width = 0.8, show.legend = FALSE) +
+  geom_text(aes(label = comma(n)), vjust = -0.3) +
+  scale_fill_manual(values = c("lightblue", "lightgreen", "red", "orange")) +
+  labs(
+    title = "Resultados de la priorización tras NetMHCpan",
+    x = NULL,
+    y = "Número de péptidos"
+  )
+```
+
+```{r}
+ggplot(resumen_alelo, aes(x = reorder(alelo, n), y = n, fill = binder_class)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("SB" = "red", "WB" = "orange"),
+    labels = c("SB" = "Strong binder", "WB" = "Weak binder")
+  ) +
+  labs(
+    title = "Número de péptidos binder por alelo HLA-I",
+    x = "Alelo HLA-I",
+    y = "Número de péptidos binder",
+    fill = "Tipo de unión"
+  )
+
+```
+
+```{r}
+ggplot(resumen_genes %>% slice_head(n = 10), aes(x = reorder(gene_symbol, n), y = n)) +
+  geom_col(fill = "lightblue") +
+  coord_flip() +
+  geom_text(aes(label = n), hjust = -0.15, size = 4) +
+  labs(
+    title = "Genes con mayor número de ocurrencias binder",
+    x = "Gen",
+    y = "Número de ocurrencias binder"
+  ) 
+```

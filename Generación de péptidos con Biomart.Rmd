@@ -1,0 +1,635 @@
+---
+title: "Generación de peptidos con Biomart"
+author: "Sara Morón El-Khalifi"
+date: "2026-04-16"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 1. Creación de la carpeta "Peptidos_mutados" en el correspondiente directorio de trabajo.
+
+```{r}
+# Establecer el directorio de trabajo
+directorio_principal <- "C:/TFM/"
+```
+
+```{r}
+# Creamos la ruta dentro de nuestra carpeta principal 'TFM' para guardar 
+# los péptidos mutados.
+output_peptidos <- file.path(directorio_principal, "Peptidos_mutados")
+# Creamos físicamente la carpeta en la ruta especificada
+dir.create(output_peptidos, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+#Guardamos la ruta del archivo de entrada con los neoantígenos candidatos 
+#priorizados y la ruta del archivo de salida peptidos_mutados.fasta.
+
+ruta_neoantigenos <- file.path(directorio_principal, "neoantigenos_candidatos_priorizados.csv")
+
+fasta_mutados <- file.path(output_peptidos, "peptidos_mutados.fasta") 
+```
+
+## 2. Filtramos las mutaciones con mayor prioridad
+
+```{r}
+library(dplyr)
+
+# Cargamos los datos de neoantígenos candidatos
+neoantigenos <- read.csv(ruta_neoantigenos, stringsAsFactors = FALSE, check.names = FALSE)
+colnames(neoantigenos)
+```
+
+```{r}
+#Filtramos las variantes que vamos a utilizar para generar los péptidos mutados, 
+# seleccionamos aquellas con prioridad_final igual a "alta" o "media", según
+#los valores que habíamos establecido para TPM y la proporción alélica de DNA.
+
+#Además, filtramos las mutaciones missense con formato p.X123Y, donde X es el 
+#aminoácido original,123 es la posición e Y es el aminoácido mutado. 
+
+#Utilizamos la función grepl() para comprobar si los valores en la columna
+#de protein_change siguen un patrón concreto. Para obtener aquellas con el 
+#formato p.X123Y, indicamos con ^ el inicio, "p\\." para indicar que debe
+#empezar por p seguido de un punto, [A-Z] para indicar que debe haber una letra 
+#mayúscula (aque corresponde con el aminoácido original), [0-9]+ para indicar 
+#que debe haber uno o más dígitos (que corresponden con la posición del 
+#aminoácido) y [A-Z] para indicar que debe haber otra letra mayúscula (que 
+#corresponde con el aminoácido mutado), el $ indica el final de la cadena y 
+#asegura que no haya caracteres adicionales después del formato especificado.
+
+neoantigenos_filtrados <- neoantigenos %>%
+  filter(
+    prioridad_final %in% c("alta"),
+    Variant_Classification == "Missense_Mutation",
+    !is.na(protein_change),
+    grepl("^p\\.[A-Z][0-9]+[A-Z]$", protein_change)
+  )
+dim(neoantigenos_filtrados)
+head(neoantigenos_filtrados)
+
+```
+
+## 3. Extraer el cambio proteico a partir de la columna protein_change para obtener el aminoácido original, la posición y el aminoácido mutado.
+
+```{r}
+# Función para extraer aminoácido original, posición y aminoácido mutado
+extraer_cambio_proteico <- function(x) {
+  cambio_proteico <- stringr::str_match(x, "^p\\.([A-Z])([0-9]+)([A-Z])$")
+  data.frame(
+    aa_referencia = cambio_proteico[, 2],
+    posicion_aa = as.integer(cambio_proteico[, 3]),
+    aa_alternativo = cambio_proteico[, 4],
+    stringsAsFactors = FALSE
+  )
+}
+
+# Aplicamos la función para extraer la información del cambio proteico y 
+#añadimos las columnas nuevas a nuestra tabla
+neoantigenos_filtrados <- cbind(
+  neoantigenos_filtrados,
+  extraer_cambio_proteico(neoantigenos_filtrados$protein_change)
+)
+
+# Comprobamos que no haya NAs
+sum(is.na(neoantigenos_filtrados$aa_referencia))
+sum(is.na(neoantigenos_filtrados$posicion_aa))
+sum(is.na(neoantigenos_filtrados$aa_alternativo))
+
+# Visualizamos el resultado
+neoantigenos_filtrados %>%
+  dplyr::select(protein_change, aa_referencia, posicion_aa, aa_alternativo) %>%
+  head(10) 
+
+```
+
+## 4. Obtenemos las secuencias de Ensembl a través de biomaRT.
+
+```{r}
+library(biomaRt)
+
+# Inicializamos columnas de salida
+neoantigenos_filtrados$wildtype_sequence <- NA_character_
+neoantigenos_filtrados$sequence_source <- NA_character_
+
+# Obtenemos los Transcript_ID únicos válidos
+transcripts_unicos <- unique(neoantigenos_filtrados$Transcript_ID)
+transcripts_unicos <- transcripts_unicos[!is.na(transcripts_unicos) & transcripts_unicos != ""]
+
+# Conectamos con Ensembl
+ensembl <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl",
+  host = "https://www.ensembl.org",
+  mirror = "www"
+)
+
+# Recuperamos la secuencia peptídica
+secuencias_ensembl <- getSequence(
+  id = transcripts_unicos,
+  type = "ensembl_transcript_id",
+  seqType = "peptide",
+  mart = ensembl
+)
+
+# Identificamos cuál es la columna de IDs devuelta por biomaRt
+columna_id <- setdiff(colnames(secuencias_ensembl), "peptide")[1]
+colnames(secuencias_ensembl)[colnames(secuencias_ensembl) == columna_id] <- "Transcript_ID_biomart"
+
+# Emparejamos cada fila de la tabla principal con la secuencia recuperada
+match_transcript <- match(
+  neoantigenos_filtrados$Transcript_ID,
+  secuencias_ensembl$Transcript_ID_biomart
+)
+
+neoantigenos_filtrados$wildtype_sequence <- secuencias_ensembl$peptide[match_transcript]
+
+neoantigenos_filtrados$sequence_source <- ifelse(
+  !is.na(neoantigenos_filtrados$wildtype_sequence) & neoantigenos_filtrados$wildtype_sequence != "",
+  "Ensembl",
+  NA_character_
+)
+
+#Comprobamos que se han recuperado las secuencias para la mayoría de 
+#las mutaciones.
+sum(!is.na(neoantigenos_filtrados$wildtype_sequence))
+sum(is.na(neoantigenos_filtrados$wildtype_sequence))
+table(neoantigenos_filtrados$sequence_source, useNA = "ifany")
+
+```
+A continuación, comprobamos que el amionácido de referencia que habíamos extraído del cambio proteico coincide con el aminoácido presente en la secuencia proteica recuperada de Ensembl en la posición indicada por la mutación.
+
+```{r}
+#Creamos una nueva columna llamada longitud_wt que mide la longitud de la 
+#secuencia proteica de referencia, utilizando nchar() para contar el número de
+#caracteres en la secuencia.
+neoantigenos_filtrados$longitud_wt <- nchar(neoantigenos_filtrados$wildtype_sequence)
+
+#Creación de una columna llamada posicion_valida que indica si la posición de la
+#mutación es válida dentro de la secuencia recuperada. La última línea indica
+#que la posición de la mutación tiene que ser menor o igual que la longitud de 
+#la proteina.
+
+neoantigenos_filtrados$posicion_valida <- !is.na(neoantigenos_filtrados$wildtype_sequence) &
+  !is.na(neoantigenos_filtrados$posicion_aa) &
+  neoantigenos_filtrados$posicion_aa >= 1 &
+  neoantigenos_filtrados$posicion_aa <= neoantigenos_filtrados$longitud_wt
+
+#Crea una nueva columna aa_en_wt que extrae el aminoácido real presente en la 
+#secuencia proteica obtenida de Ensembl.
+
+neoantigenos_filtrados$aa_en_wt <- ifelse(
+  neoantigenos_filtrados$posicion_valida,
+  substr(
+    neoantigenos_filtrados$wildtype_sequence,
+    neoantigenos_filtrados$posicion_aa,
+    neoantigenos_filtrados$posicion_aa
+  ),
+  NA_character_
+)
+
+#Creamos una nueva columna coincide_aa_referencia que indica si el aminoácido
+#en la wt_sequence que habíamos recuperado con Biomart coincide con el 
+#aminoácido original que muestra protein_change (aa_referencia).
+
+neoantigenos_filtrados$coincide_aa_referencia <- neoantigenos_filtrados$posicion_valida & neoantigenos_filtrados$aa_en_wt == neoantigenos_filtrados$aa_referencia
+
+#Contamos cuántos casos tenemos en los que concide el aminoácido de referencia
+#con el aminoácido presente en la secuencia recuperada.
+
+table(neoantigenos_filtrados$coincide_aa_referencia, useNA = "ifany")
+
+neoantigenos_filtrados %>%
+  dplyr::select(
+    protein_change,
+    aa_referencia,
+    posicion_aa,
+    aa_en_wt,
+    coincide_aa_referencia,
+    sequence_source
+  ) %>%
+  head(10)
+
+```
+
+```{r}
+#Revisamos a mano unos cuantos ejemplos concretos para validar que el 
+#aminoácido de referencia coincide con el aminoácido presente en la secuencia 
+#recuperada. Para esto, filtramos los casos con sequence_source igual a 
+#"Ensembl" y con coincide_aa_referencia igual a TRUE, y seleccionamos una 
+#muestra aleatoria de 5 casos de cada fuente para revisar manualmente.
+
+set.seed(123)
+
+#Creamos una tabla llamada ejemplos_ensembl, donde establecemos como filtro
+# que sequence_source sea igual a "Ensembl" y coincide_aa_referencia sea TRUE. 
+#Utilizamos slice_sample() para seleccionar una muestra aleatoria de casos que 
+#cumplan estas condiciones, indicando prop = 1 para seleccionar el 100% de los 
+#casos que cumplen los filtros.
+
+ejemplos_validados <- neoantigenos_filtrados %>%
+  dplyr::filter(sequence_source == "Ensembl", coincide_aa_referencia) %>%
+  dplyr::slice_sample(prop = 1) %>%
+  head(5) %>%
+  dplyr::select(
+    Hugo_Symbol,
+    protein_change,
+    aa_referencia,
+    posicion_aa,
+    aa_alternativo,
+    SWISSPROT,
+    UNIPROT_ISOFORM,
+    Transcript_ID,
+    sequence_source,
+    aa_en_wt,
+    coincide_aa_referencia,
+  )
+ejemplos_validados
+```
+
+Filtramos solo los casos con coincide_aa_referencia == TRUE para asegurarnos de que el aminoácido de referencia coincide con el aminoácido en la secuencia proteica de referencia en la posición indicada.
+
+```{r}
+table(neoantigenos_filtrados$sequence_source, useNA = "ifany")
+
+# Nos quedamos solo con los casos en los que la secuencia recuperada es coherente
+neoantigenos_validos <- neoantigenos_filtrados %>%
+  dplyr::filter(coincide_aa_referencia)
+
+dim(neoantigenos_validos)
+```
+Nos quedamos solo con los casos donde coincide_aa_referencia es TRUE para asegurarnos de que estamos trabajando con secuencias válidas para generar los péptidos mutados.
+
+## 5. Generación de los péptidos mutados.
+
+### 5.1. Creamos una función para crear la secuencia proteica mutada sustituyendo el aminoácido de referencia por el aminoácido mutado.
+
+```{r}
+#1. Creamos una función para crear la secuencia proteica mutada sustituyendo
+#el aminoácido de referencia por el aminoácido mutado.
+derivar_secuencia_mutada <- function(wt_seq, pos_aa, aa_mutado) {
+  if (is.na(wt_seq) || is.na(pos_aa) || is.na(aa_mutado) || pos_aa < 1 || pos_aa > nchar(wt_seq)) {
+    return(NA_character_)
+  }
+  substr(wt_seq, pos_aa, pos_aa) <- aa_mutado
+  wt_seq
+}
+```
+
+### 5.2. Generamos los péptidos mutados de 8 a 11 aminoácidos  que incluyan la 
+#posición mutada.
+
+```{r}
+#Definimos nuestra función con 4 entradas: la secuencia proteica original, la 
+#posición de la mutación, el aminoácido mutado y las longitudes de los péptidos
+#que queremos generar.
+#Llamamos a la función que habíamos generado justo antes que cambia el
+#aminoácido de referencia por el aminoácido mutado para obtener la secuencia 
+#mutada. Guardamos los resultados en una lista, se crearán 4 grupos:
+#longitud 8, longitud 9, longitud 10 y longitud 11.
+
+generar_peptidos_mutados <- function(seq_wt, position, aa_alt, lengths = 8:11) {
+  seq_mut <- derivar_secuencia_mutada(seq_wt, position, aa_alt)
+  
+#Comprobamos que no falte la información necesaria
+  
+  if (is.na(seq_mut) || is.na(seq_wt) || is.na(position)) {
+    return(data.frame())
+  }
+  
+#Creamos una lista vacía para almacenar los resultados de cada longitud de 
+#péptido. 
+  
+  resultado <- vector("list", length(lengths))
+  
+  #Recorremos las longitudes una a una guardando en la variable len la longitud
+  #que toca en cada interación. 
+  
+  for (j in seq_along(lengths)) {
+    len <- lengths[j]
+    
+    start_min <- max(1, position - len + 1)
+    start_max <- min(position, nchar(seq_wt) - len + 1)
+    
+    if (start_min > start_max) {
+      resultado[[j]] <- NULL
+      next
+    }
+    
+    starts <- seq(start_min, start_max)
+    
+    peptidos_wt <- substring(seq_wt, starts, starts + len - 1)
+    peptidos_mut <- substring(seq_mut, starts, starts + len - 1)
+    
+    keep <- peptidos_wt != peptidos_mut & !grepl("\\*", peptidos_mut)
+    
+    if (!any(keep)) {
+      resultado[[j]] <- NULL
+      next
+    }
+    
+    resultado[[j]] <- data.frame(
+      peptide_length = len,
+      window_start = starts[keep],
+      window_end = starts[keep] + len - 1,
+      posicion_mutada_en_peptido = position - starts[keep] + 1,
+      peptido_wt = peptidos_wt[keep],
+      peptido_mutado = peptidos_mut[keep],
+      stringsAsFactors = FALSE
+    )
+  }
+  resultado <- resultado[!vapply(resultado, is.null, logical(1))]
+  
+  if (!length(resultado)) {
+    return(data.frame())
+  }
+  
+  unique(dplyr::bind_rows(resultado))
+}
+```
+
+### 5.3. Generar los péptidos mutados para cada variante válida.
+
+```{r}
+lista_peptidos <- vector("list", nrow(neoantigenos_validos))
+
+columnas_info <- intersect (
+  c(
+  "patient_id",
+  "sample_id",
+  "gene_symbol",
+  "protein_change",
+  "TPM",
+  "proporcion_alelica_dna",
+  "prioridad_final",
+  "sequence_source"
+  ),
+  colnames(neoantigenos_validos)
+)
+
+#Creamos un bucle que recorra las filas de neoantigenos_validados una a una, 
+#y para cada una se extrae la información de la secuencia proteica de 
+#referencia, la posición de la mutación y el aminoácidos alternativo, que
+#son los datos necesarios para utilizar la función generar_peptidos_mutados().
+
+for (i in seq_len(nrow(neoantigenos_validos))) {
+  fila <- neoantigenos_validos[i, , drop = FALSE]
+  
+  peptidos <- generar_peptidos_mutados(
+    seq_wt = fila$wildtype_sequence,
+    position = fila$posicion_aa,
+    aa_alt = fila$aa_alternativo
+  )
+  
+  if (nrow(peptidos) == 0) next
+  
+  info_variante <- fila[rep(1, nrow(peptidos)), columnas_info, drop = FALSE]
+  lista_peptidos[[i]] <- cbind(info_variante, peptidos, stringsAsFactors = FALSE)
+}
+
+#Eliminamos los casos vacíos de la lista.
+lista_peptidos <- lista_peptidos[!vapply(lista_peptidos, is.null, logical(1))]
+
+#Creamos la tabla final de péptidos mutados uniendo todas las filas   
+#individuales de cada variante.
+if (!length(lista_peptidos)) {
+  tabla_peptidos_mutados <- data.frame()
+} else {
+  tabla_peptidos_mutados <- dplyr::bind_rows(lista_peptidos)
+}
+
+dim(tabla_peptidos_mutados)
+head(tabla_peptidos_mutados)
+saveRDS(tabla_peptidos_mutados, "C:/TFM/tabla_peptidos_mutados.rds")
+```
+
+### 5.4. Exportamos los péptidos mutados a FASTA
+
+```{r}
+#Cargamos el paquete Biostrings para poder escribir archivos FASTA y trabajar
+#con secuencias biológicas.
+
+library(Biostrings)
+
+# Ruta para exportar los péptidos mutados (Creo que ya la había creado anteriormente)
+fasta_mutados <- file.path(output_peptidos, "peptidos_mutados.fasta")
+
+# Ruta para exportar también los péptidos WT
+fasta_wt <- file.path(output_peptidos, "peptidos_wt.fasta")
+
+#Creamos un identificador para cada peptido mutado que incluirá el número de 
+#paciente, el número de muestra, el gen, el cambio proteico y la longitud del 
+#péptido. Esto nos ayudará a identificar cada secuencia en el archivo FASTA.
+
+if (nrow(tabla_peptidos_mutados) > 0) {
+  
+  ids_fasta <- paste0(
+    "pep_", seq_len(nrow(tabla_peptidos_mutados)), "_",
+    tabla_peptidos_mutados$patient_id, "_",
+    tabla_peptidos_mutados$sample_id, "_",
+    tabla_peptidos_mutados$gene_symbol, "_",
+    tabla_peptidos_mutados$protein_change, "_",
+    tabla_peptidos_mutados$peptide_length, "aa"
+  )
+  
+# FASTA de péptidos mutados
+  peptidos_mutados_fasta <- AAStringSet(tabla_peptidos_mutados$peptido_mutado)
+  names(peptidos_mutados_fasta) <- ids_fasta
+  writeXStringSet(peptidos_mutados_fasta, fasta_mutados)
+  
+# FASTA de péptidos WT
+  peptidos_wt_fasta <- AAStringSet(tabla_peptidos_mutados$peptido_wt)
+  names(peptidos_wt_fasta) <- ids_fasta
+  writeXStringSet(peptidos_wt_fasta, fasta_wt)
+}
+
+file.exists(fasta_mutados)
+file.exists(fasta_wt)
+nrow(tabla_peptidos_mutados)
+head(tabla_peptidos_mutados[, c("peptido_wt", "peptido_mutado", "peptide_length")], 5)
+```
+
+```{r}
+#Vemos cuántos péptidos por longitud:
+table(tabla_peptidos_mutados$peptide_length)
+```
+```{r}
+#Cantidad combinaciones distintas de nuestros datos
+length(unique(paste(
+  tabla_peptidos_mutados$patient_id,
+  tabla_peptidos_mutados$sample_id,
+  tabla_peptidos_mutados$gene_symbol,
+  tabla_peptidos_mutados$protein_change,
+  sep = "_"
+)))
+
+```
+```{r}
+#Cantidad de péptidos mutados únicos
+length(unique(tabla_peptidos_mutados$peptido_mutado))
+
+```
+```{r}
+peptidos_mutados_peptide <- unique(tabla_peptidos_mutados$peptido_mutado)
+writeLines(
+  peptidos_mutados_peptide,
+  file.path(output_peptidos, "peptidos_mutados_peptide.txt")
+)
+```
+
+```{r}
+length(peptidos_mutados_peptide)
+head(peptidos_mutados_peptide, 10)
+```
+
+## 6. Análisis de cohorte:
+
+### 6.1. Mutaciones recurrentes.
+```{r}
+#Creamos una tabla agrupando las mutaciones por gen y cambio proteico, y 
+#contamos cuantas veces aparece cada una, en cuántos pacientes aparecen y en
+#cuántas muestras, y ordenamos el resultado de mayor a menor recurrencia.
+
+mutaciones_recurrentes <- neoantigenos_validos %>%
+  dplyr::group_by(gene_symbol, protein_change) %>%
+  dplyr::summarise(
+    n_eventos = dplyr::n(),
+    n_pacientes = dplyr::n_distinct(patient_id),
+    n_muestras = dplyr::n_distinct(sample_id),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_pacientes), dplyr::desc(n_eventos))
+
+mutaciones_recurrentes
+
+```
+
+
+### 6.2. Péptidos mutados recurrentes
+```{r}
+#Creamos una tabla para ver qué péptidos mutados se repiten en varios pacientes.
+#Para ello, eliminamos los duplicados presentes según la combinación de 
+#paciente, muestra, gen, cambio proteico, longitud del péptido y secuencia
+#peptídica mutada. Después, agrupamos por peptido mutado y su longitud, y 
+#calculamos cuántos eventos, pacientes y muestras distintas presentan cada uno.
+#Además, añadimos columnas con los genes y mutaciones que originan cada péptido
+#y ordenamos la tabla de mayor a menor recurrencia.
+
+peptidos_unicos <- tabla_peptidos_mutados %>%
+  dplyr::distinct(
+    patient_id,
+    sample_id,
+    gene_symbol,
+    protein_change,
+    peptide_length,
+    peptido_mutado,
+    .keep_all = TRUE
+  )
+
+peptidos_recurrentes <- peptidos_unicos %>%
+  dplyr::group_by(peptido_mutado, peptide_length) %>%
+  dplyr::summarise(
+    n_eventos = dplyr::n(),
+    n_pacientes = dplyr::n_distinct(patient_id),
+    n_muestras = dplyr::n_distinct(sample_id),
+    genes = paste(sort(unique(gene_symbol)), collapse = "; "),
+    mutaciones = paste(sort(unique(protein_change)), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_pacientes), dplyr::desc(n_eventos))
+
+peptidos_recurrentes
+
+```
+
+```{r}
+#Reducimos el conjunto para obtener una cantidad compatible que permita el uso
+#de NetMHCpan. Para ello, filtramos por recurrencia a nivel de péptido.
+#Calculamos cuántos péptidos aparecen en más de 2, 3 y 5 pacientes, y cuántos
+#péptidos aparecen en nuestra tabla más de 2 y 3 veces.
+
+peptidos_recurrentes %>%
+  dplyr::summarise(
+    total_peptidos = dplyr::n(),
+    peptidos_n_pacientes_min_2 = sum(n_pacientes >=2),
+    peptidos_n_pacientes_min_3 = sum(n_pacientes >=3),
+    peptidos_n_pacientes_min_5 = sum(n_pacientes >=5),
+    peptidos_n_eventos_min_2 = sum(n_eventos >=2),
+    peptidos_n_eventos_min_3 = sum(n_eventos >=3)
+    )
+```
+
+```{r}
+#Finalmente nos quedamos con aquellos péptidos que aparecen en al menos dos
+#pacientes
+peptidos_recurrentes_filtrados <- peptidos_recurrentes %>%
+  dplyr::filter(n_pacientes >=2) %>%
+  dplyr::arrange(dplyr::desc(n_pacientes), dplyr::desc(n_eventos))
+
+nrow(peptidos_recurrentes_filtrados)
+head(peptidos_recurrentes_filtrados)
+saveRDS(peptidos_recurrentes_filtrados, "C:/TFM/peptidos_recurrentes_filtrados.rds")
+```
+
+```{r}
+#Vemos cuántos péptidos recurrentes obtenemos de cada longitud
+
+resumen_peptidos_recurrentes <- peptidos_recurrentes_filtrados %>%
+  dplyr::count(peptide_length, name = "n_peptidos") %>%
+  dplyr::mutate(
+    porcentaje = round(100*n_peptidos / sum(n_peptidos), 2)
+  ) %>%
+  dplyr::arrange(peptide_length)
+
+resumen_peptidos_recurrentes
+```
+
+
+```{r}
+peptidos_mutados_recurrentes <- peptidos_recurrentes_filtrados$peptido_mutado
+
+writeLines(
+  peptidos_mutados_recurrentes,
+  file.path(output_peptidos, "peptidos_mutados_recurrentes.txt")
+)
+
+length(peptidos_mutados_recurrentes)
+head(peptidos_mutados_recurrentes, 10)
+```
+
+
+## 7. Creamos un subconjunto de prueba de 20.000 péptidos mutados únicos con prioridad alta:
+
+```{r}
+set.seed(123)
+subconjunto_mutados <- tabla_peptidos_mutados %>%
+  filter(prioridad_final == "alta") %>%
+  distinct(peptido_mutado, .keep_all = TRUE)
+
+length(subconjunto_mutados)
+
+subconjunto_mutados_n <- subconjunto_mutados %>%
+  slice_sample(n = min(20000, nrow(subconjunto_mutados)))
+
+dim(subconjunto_mutados_n) 
+
+```
+```{r}
+#Extraemos y guardamos la lista de péptidos en formato Peptide
+
+subconjunto_mutados_n_netmhcpan <- subconjunto_mutados_n$peptido_mutado
+ruta_subconjunto_mutados_n_netmhcpan <- file.path(output_peptidos, "subconjunto_mutados_n_netmhcpan.txt")
+writeLines(subconjunto_mutados_n_netmhcpan, ruta_subconjunto_mutados_n_netmhcpan)
+
+writeLines(subconjunto_mutados_n_netmhcpan, ruta_subconjunto_mutados_n_netmhcpan)
+write.csv(subconjunto_mutados_n_netmhcpan, file.path(output_peptidos, "subconjunto_mutados_n_netmhcpan.csv"), row.names = FALSE)
+
+length(subconjunto_mutados_n_netmhcpan)
+head(subconjunto_mutados_n_netmhcpan, 10)
+```

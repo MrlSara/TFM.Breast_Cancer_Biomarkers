@@ -1,0 +1,528 @@
+---
+title: "Descarga y selección de datos de TCGA-BRCA"
+author: "Sara Morón El-Khalifi"
+date: "2026-03-07"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Preparamos el entorno de trabajo.
+
+```{r}
+#Creación de un directorio de trabajo para los archivos del TFM
+
+#dir.create("C:/TFM", showWarnings = FALSE)
+setwd("C:/TFM")
+getwd()
+```
+
+```{r}
+#Instalamos y cargamos el paquete TCGAbiolinks de Bioconductor para descargar 
+#el dataset TCGA-BRCA 
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("TCGAbiolinks", "SummarizedExperiment", "maftools"), update = FALSE, ask = FALSE)
+```
+
+```{r}
+#Cargamos los paquetes necesarios
+library(TCGAbiolinks)
+library(tidyverse)
+library(maftools)
+library(SummarizedExperiment)
+```
+
+## 2. Descarga de los datos del proyecto TCGA-BRCA, correspondientes al cáncer de mama.
+
+Descargaremos de este proyecto las mutaciones somáticas (MAF files) y los datos 
+de expresión génica RNA-seq. 
+
+```{r}
+#Obtenemos las listas de los proyectos disponibles en el portal GDC, entre los
+#nos cuales nos interesa seleccionar el proyecto TCGA-BRCA.
+gdcprojects <- getGDCprojects()
+#Nos muestra un total de 91 proyectos.
+
+#Al realizar un filtrado de 'Breast' en el resultado de ejecutar gcdprojects, 
+#obtenemos dos proyectos relacionados con el cáncer de mama: TCGA-BRCA y CMI-MBC.
+#Seleccionamos el proyecto TCGA-BRCA, que es el que nos interesa para nuestro 
+#análisis. 
+getProjectSummary('TCGA-BRCA')
+#Obtenemos información sobre los detalles de este proyecto, omo el número 
+#de casos (1098), cuántos archivos hay (70774), y qué tipo de datos 
+#están disponibles en él.
+```
+
+Descarga y preparación de los datos de expresión génica (RNA-seq).
+
+```{r}
+#Construimos nuestra consulta para obtener los datos de expresión génica de
+#RNA-seq.
+query_TCGA <- GDCquery(project = 'TCGA-BRCA',
+         data.category = 'Transcriptome Profiling')
+
+output_query_TCGA <- getResults(query_TCGA)
+
+#Nos devuelve un total de 4876 archivos, algunos con acceso cerrado y
+#otros con acceso abierto. Algunos son de expresión génica, otros expresión
+#de microARN. Podemos añadir filtros para restringir nuestra búsqueda y recuperar
+#solo la cohorte que nos interese para avanzar con el análisis de 
+#los datos.
+```
+
+```{r}
+#Añadimos filtros para restringir mi búsqueda, para que incluyan únicamente 
+#datos de secuenciacion de RNA-seq, que el workflow sea STAR-Counts, y 
+#únicamente los archivos con acceso abierto, es decir, sin restricciones. 
+
+if (file.exists("query_rnaseq.rds")) {
+  query_rnaseq <- readRDS("query_rnaseq.rds")
+} else {
+  query_rnaseq <- GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "Transcriptome Profiling",
+    experimental.strategy = "RNA-Seq",
+    workflow.type = "STAR - Counts",
+    access = "open"
+  )
+  saveRDS(query_rnaseq, "query_rnaseq.rds")
+}
+
+output_rnaseq <- getResults(query_rnaseq)
+```
+
+
+```{r}
+#Descargamos los archivos query_rnaseq que cumplen con los criterios que 
+#habíamos establecido en la consulta anterior, y preparamos el dataset para 
+#obtener la matriz de expresión génica.
+
+#Creamos un Summarized Experiment a partir de la consulta realizada para obtener
+#los datos de expresión génica.
+
+if (file.exists("rnaseq_dataset.rds")) {
+  rnaseq_dataset <- readRDS("rnaseq_dataset.rds")
+} else {
+  GDCdownload(query = query_rnaseq, method = "api", files.per.chunk = 20)
+  rnaseq_dataset <- GDCprepare(query_rnaseq, summarizedExperiment = TRUE)
+  saveRDS(rnaseq_dataset, "rnaseq_dataset.rds")
+}
+
+```
+
+```{r}
+#Selecciono el workflow 'tpm_unstrand' para obtener la matriz de expresión 
+#génica en unidades de TPM
+rnaseq_tpm_matriz <- assay(rnaseq_dataset, "tpm_unstrand")
+```
+
+Descargar y preparar los datos de mutaciones somáticas (MAF files)
+
+```{r}
+#Realizamos una consulta para obtener todos los casos de maf en TCGA-BRCA 
+#con acceso abierto
+
+if (file.exists("query_maf.rds")) {
+  query_maf <- readRDS("query_maf.rds")
+} else {
+  query_maf <- GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "Simple Nucleotide Variation",
+    access = "open"
+  )
+  saveRDS(query_maf, "query_maf.rds")
+}
+
+output_maf <- getResults(query_maf)
+```
+
+```{r}
+#Exploración del dataset completo de maf para estudiar las mutaciones
+#no sinónimas. Para ello, descargamos el dataset completo de maf, y lo 
+#preparamos para obtener un Summarized Experiment con toda la información de las
+#mutaciones somáticas.
+
+if (file.exists("maf_dataset.rds")) {
+  maf_dataset <- readRDS("maf_dataset.rds")
+} else {
+  GDCdownload(query_maf)
+  maf_dataset <- GDCprepare(query_maf, summarizedExperiment = TRUE)
+  saveRDS(maf_dataset, file = "maf_dataset.rds")
+}
+
+#Comprobamos que el dataset se ha cargado correctamente
+dim(maf_dataset)
+head(maf_dataset)
+```
+
+```{r}
+#Vamos a explorar la columna 'Variant Classification'que es la que nos indica 
+#el tipo de mutación para ver qué tipos de mutaciones hay en el dataset, y así 
+#definir con claridad el criterio de 'mutación no sinónima expresada'.
+
+sort(unique(maf_dataset$Variant_Classification))
+table(maf_dataset$Variant_Classification)
+```
+## 3. Filtramos las mutaciones no sinónimas.
+
+```{r}
+# Para nuestro análisis nos interesa usar las mutaciones no sinónimas.
+
+library(dplyr)
+
+clases_no_sinonimas <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Nonstop_Mutation",
+  "Translation_Start_Site"
+)
+
+maf_no_sinonimas <- maf_dataset %>%
+  filter(Variant_Classification %in% clases_no_sinonimas)
+```
+
+```{r}
+# Mostramos las mutaciones no sinónimas y su distribución por tipo.
+table(maf_no_sinonimas$Variant_Classification)
+dim(maf_no_sinonimas)
+```
+
+```{r}
+#Tabla de mutaciones no sinónimas
+#A continuación, vamos a crear una tabla limpia con las columnas que nos 
+#interesan para integrar con los datos de expresión génica.
+
+maf_no_sinonimas_preparado <- maf_dataset %>%
+  filter(Variant_Classification %in% clases_no_sinonimas) %>%
+  mutate(
+    patient_id = substr(Tumor_Sample_Barcode, 1, 12),
+    sample_id  = substr(Tumor_Sample_Barcode, 1, 16),
+    gene_symbol = Hugo_Symbol,
+    protein_change = coalesce(HGVSp_Short, HGVSp)
+  ) %>%
+  select(
+    patient_id,
+    sample_id,
+    Tumor_Sample_Barcode,
+    Hugo_Symbol,
+    gene_symbol,
+    Chromosome,
+    Start_Position,
+    End_Position,
+    Reference_Allele,
+    Tumor_Seq_Allele2,
+    Variant_Classification,
+    Variant_Type,
+    protein_change,
+    HGVSp,
+    Amino_acids,
+    Protein_position,
+    SWISSPROT,
+    UNIPROT_ISOFORM,
+    RefSeq,
+    Transcript_ID,
+    t_depth,
+    t_ref_count,
+    t_alt_count,
+    n_depth,
+    n_ref_count,
+    n_alt_count,
+    RNA_Support,
+    RNA_depth,
+    RNA_ref_count,
+    RNA_alt_count
+  ) %>%
+  filter(!is.na(gene_symbol), gene_symbol != "") %>%
+  distinct()
+
+dim(maf_no_sinonimas_preparado)
+head(maf_no_sinonimas_preparado)
+saveRDS(maf_no_sinonimas_preparado, file = "maf_no_sinonimas_preparado.rds")
+```
+
+## 4. Preparamos la tabla de expresión génica para poder cruzarla con la tabla de mutaciones no sinónimas.
+
+```{r}
+#Vamos a transformar la matriz de expresión génica para que tenga el mismo 
+#formato que la tabla de mutaciones no sinónimas.
+#Para ello, convertimos la matriz de expresión génica en un data frame, pasamos
+#los nombres de las filas a una columna llamada 'gene_id' y añadimos una columna
+#llamada 'gene_symbol' con los nombres de los genes.
+
+#Giramos las columnas que corresponden a las muestras a filas con pivot_longer, 
+#de manera que tengamos filas con el nombre de la muestra (sample_barcode), 
+#y los valores que habían dentro de esas filas se convierten en una columna 
+#llamada 'TPM' con los valores de expresión génica.
+
+#Agrupamos por sample_id y gene_symbol, y sumamos los valores de TPM para cada 
+#combinación de muestra y gen, para obtener una tabla con la expresión génica 
+#total por muestra y gen.
+
+rnaseq_expr <- as.data.frame(rnaseq_tpm_matriz) %>%
+  tibble::rownames_to_column("gene_id") %>%
+  mutate(gene_symbol = rowData(rnaseq_dataset)$gene_name) %>%
+  pivot_longer(
+    cols = -c(gene_id, gene_symbol),
+    names_to = "sample_barcode",
+    values_to = "TPM"
+  ) %>%
+  mutate(sample_id = substr(sample_barcode, 1, 16)) %>%
+  filter(!is.na(gene_symbol), gene_symbol != "") %>%
+  group_by(sample_id, gene_symbol) %>%
+  summarise(TPM = sum(TPM, na.rm = TRUE), .groups = "drop")
+
+dim(rnaseq_expr)
+head(rnaseq_expr)
+
+```
+
+## 5. Cruzamos la tabla de mutaciones no sinónimas y la tabla de expresión génica.
+
+Realizamos el cruce entre la tabla de mutaciones no sinónimas por gen y muestra,
+y la tabla de expresión génica por muestra y gen, para obtener una tabla que nos
+permita identificar qué mutaciones no sinónimas están presentes en genes que se
+expresan en las muestras correspondientes.
+
+```{r}
+#Cruce
+maf_expr_cruce <- maf_no_sinonimas_preparado %>%
+  left_join(rnaseq_expr, by = c("sample_id", "gene_symbol"))
+
+dim(maf_expr_cruce)
+head(maf_expr_cruce) 
+```
+
+```{r}
+#Comprobación del cruce
+summary(maf_expr_cruce$TPM)
+sum(is.na(maf_expr_cruce$TPM))
+sum(maf_expr_cruce$TPM > 0, na.rm = TRUE)
+sum(maf_expr_cruce$TPM == 0, na.rm = TRUE)
+
+#Obtenemos un total de 62693 mutaciones no sinónimas con un valor- de TPM mayor 
+#que 0 presentes en genes que se expresan en las muestras correspondientes.
+```
+
+## 6. Identificamos neoantígenos candidatos a partir de la tabla resultante del cruce entre maf y expresión génica.
+
+Aplicamos los criterios para detectar neoantígenos no sinónimos expresados, que incluyen que la mutación sea no sinónima, que el gen se exprese por encima del umbral TPM>1, que la mutación se detecte (RNA_alt_count > 0), y que de lugar a un cambio proteico.
+
+```{r}
+#Ordenamos los neoantígenos candidatos por nivel de prioridad, TPM, proporción
+#alélica de RNA y proporción alélica de DNA.
+
+neoantigenos_candidatos <- maf_expr_cruce %>%
+  mutate(
+    proporcion_alelica_dna = ifelse(!is.na(t_depth) & t_depth > 0, t_alt_count / t_depth, NA_real_),
+    proporcion_alelica_rna = ifelse(!is.na(RNA_depth) & RNA_depth > 0, RNA_alt_count / RNA_depth, NA_real_),
+    gen_expresado = !is.na(TPM) & TPM > 0,
+    variante_detectada_rna = !is.na(RNA_alt_count) & RNA_alt_count > 0,
+    con_cambio_proteico = !is.na(protein_change) & protein_change != "",
+    nivel_prioridad = case_when(
+      gen_expresado & variante_detectada_rna ~ "alta",
+      gen_expresado ~ "media",
+      TRUE ~ "baja"
+    ),
+    nivel_prioridad = factor(nivel_prioridad, levels = c("alta", "media", "baja"))
+  ) %>%
+  filter(
+    Variant_Classification %in% clases_no_sinonimas,
+    con_cambio_proteico,
+    gen_expresado
+  ) %>%
+  arrange(nivel_prioridad, desc(TPM), desc(proporcion_alelica_rna), desc(proporcion_alelica_dna))
+
+dim(neoantigenos_candidatos)
+head(neoantigenos_candidatos)
+table(neoantigenos_candidatos$nivel_prioridad, useNA = "ifany")
+
+```
+
+El resultado muestra que todas las variantes quedan clasificadas como media, es decir, se expresan por encima del umbral de TPM>0 pero no presentan RNA_alt_count > 0, lo que indica que esta variable no es informativa en este contexto, ya que la mutación no se detecta en RNA. Esto puede deberse a que el nivel de expresión del gen es bajo. Por tanto, para priorizar los neoantígenos candidatos nos centraremos en la expresión génica (TPM) y en la proporción alélica de DNA, que sí presentan variabilidad en el dataset.
+
+```{r}
+#Resumen de los candidatos obtenidos
+
+resumen_candidatos <- sort(
+  table(neoantigenos_candidatos$Variant_Classification),
+  decreasing = TRUE
+)
+
+resumen_candidatos
+
+```
+
+## 7. Priorización utilizando la proporción alélica de DNA y TPM.
+
+```{r}
+neoantigenos_candidatos_priorizados <- neoantigenos_candidatos %>%
+  mutate(
+    categoria_tpm = case_when(
+      TPM >= 10 ~ "alta",
+      TPM >= 1 ~ "media",
+      TRUE ~ "baja"
+    ),
+    categoria_dna = case_when(
+      !is.na(proporcion_alelica_dna) & proporcion_alelica_dna >= 0.25 ~ "alta",
+      !is.na(proporcion_alelica_dna) & proporcion_alelica_dna >= 0.10 ~ "media",
+      !is.na(proporcion_alelica_dna) ~ "baja",
+      TRUE ~ "sin_dato"
+    ),
+    prioridad_final = case_when(
+      categoria_tpm == "alta" & categoria_dna == "alta" ~ "alta",
+      categoria_tpm %in% c("alta", "media") & categoria_dna %in% c("alta", "media") ~ "media",
+      TRUE ~ "baja"
+    ),
+    prioridad_final = factor(prioridad_final, levels = c("alta", "media", "baja"))
+  ) %>%
+  arrange(
+    prioridad_final,
+    desc(TPM),
+    desc(proporcion_alelica_dna)
+  )
+
+
+dim(neoantigenos_candidatos_priorizados)
+head(neoantigenos_candidatos_priorizados)
+table(neoantigenos_candidatos_priorizados$prioridad_final, useNA = "ifany")
+write.csv(neoantigenos_candidatos_priorizados,
+          "neoantigenos_candidatos_priorizados.csv", row.names = FALSE)
+```
+
+```{r}
+top_neoantigenos <- neoantigenos_candidatos_priorizados %>%
+  select(
+    patient_id,
+    sample_id,
+    gene_symbol,
+    Variant_Classification,
+    protein_change,
+    TPM,
+    proporcion_alelica_dna,
+    prioridad_final
+  ) %>%
+  slice_head(n = 50)
+
+top_neoantigenos
+
+```
+
+## 8. Gráficos para seleccionar nuestros criterios
+
+```{r}
+#Examinamos los distintos umbrales de valores para TPM.
+
+tabla_tpm <- maf_expr_cruce %>%
+  dplyr::mutate(
+    categoria_tpm = dplyr::case_when(
+      TPM == 0 ~ "0",
+      TPM > 0 & TPM < 1 ~ "0-1",
+      TPM >= 1 & TPM < 5 ~ "1-5",
+      TPM >= 5 & TPM < 10 ~ "5-10",
+      TPM >= 10 & TPM < 50 ~ "10-50",
+      TPM >= 50 ~ ">50",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::group_by(categoria_tpm) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop")
+
+ggplot(tabla_tpm, aes(x = categoria_tpm, y = n)) +
+  geom_col(fill = "#2C7FB8") +
+  labs(
+    title = "Distribución de variantes según la expresión del gen mutado",
+    x = "Rango de TPM",
+    y = "Número de variantes"
+  ) +
+  theme_minimal()
+
+```
+
+En el gráfico vemos que hay una proporción importante de mutaciones tanto en genes con niveles de TPM relativamente bajos, como también en genes con niveles de TPM altos. Aquellos con un nivel de expresión muy bajo podrían no ser relevantes para la generación de neoantígenos.
+
+```{r}
+# Distribución de la proporción alélica en DNA
+
+maf_expr_cruce <- maf_expr_cruce %>%
+  mutate(
+    proporcion_alelica_dna = ifelse(!is.na(t_depth) & t_depth > 0, t_alt_count / t_depth, NA_real_)
+  )
+
+ggplot(maf_expr_cruce, aes(x = proporcion_alelica_dna)) +
+  geom_histogram(bins = 40, fill = "#D95F0E", color = "white") +
+  labs(
+    title = "Distribución de la proporción alélica en DNA",
+    x = "Proporción alélica en DNA",
+    y = "Número de mutaciones"
+  ) +
+  theme_minimal()
+```
+
+Se observan algunas mutaciones con una proporción alélica de DNA baja, que podría indicar que son subclonales o que tienen un soporte bajo en el tumor. Para priorizar los neoantígenos candidatos estableceremos el umbral para la proporción alélica de DNA >= 0.10 para considerar que una mutación tiene un soporte moderado del tumor y un umbral > 0.25 para considerar que tiene un soporte alto.
+
+```{r}
+# Frecuencia de los tipos de mutación.
+
+maf_expr_cruce %>%
+  dplyr::count(Variant_Classification, sort = TRUE) %>%
+  ggplot(aes(x = reorder(Variant_Classification, n), y = n)) +
+  geom_col(fill = "#31A354") +
+  coord_flip() +
+  labs(
+    title = "Frecuencia de los tipos de mutación",
+    x = "Tipo de mutación",
+    y = "Número de mutaciones"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#Número total de filas de maf_expr_cruce
+maf_expr_cruce %>%
+  summarise(
+    total = n())
+
+#Evaluamos qué peso tienen las variantes dentro del tumor observando la fracción
+#alélica de DNA.
+maf_expr_cruce %>%
+  summarise(
+    total_datos_DNA = sum(!is.na(proporcion_alelica_dna)),
+    pct_VAF_menor_0_05 = mean(proporcion_alelica_dna < 0.05, na.rm = TRUE) * 100,
+    pct_VAF_menor_0_10 = mean(proporcion_alelica_dna < 0.10, na.rm = TRUE) * 100,
+    pct_VAF_menor_0_20 = mean(proporcion_alelica_dna < 0.20, na.rm = TRUE) * 100,
+    pct_VAF_mayor_0_25 = mean(proporcion_alelica_dna >= 0.25, na.rm = TRUE) * 100
+  )
+```
+
+Observamos que tenemos datos de proporción alélica de DNA para todas las variantes. En los resultados podemos distinguir entre variantes con soporte bajo y variantes con soporte moderado/alto para la proporción alélica de DNA.
+
+```{r}
+#Establecemos distintos umbrales de TPM para averiguar cuántas mutaciones 
+#quedarían en cada uno de ellos.
+umbrales <- c(0, 0.1, 1, 5, 10)
+
+#Exluimos aquellas filas con valores de TPM que aparecen como NA.
+tibble::tibble(umbral_tpm = umbrales) %>%
+  dplyr::mutate(
+    total_sin_NAs = sum(!is.na(maf_expr_cruce$TPM)),
+    n_mutaciones = sapply(
+      umbral_tpm,
+      function(x) sum(maf_expr_cruce$TPM > x, na.rm = TRUE)
+    ),
+    porcentaje_mutaciones = round(n_mutaciones / total_sin_NAs * 100, 3)
+  )
+
+```
